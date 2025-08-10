@@ -1,107 +1,82 @@
-// api/x-daily.ts
-import type { VercelRequest, VercelResponse } from '@vercel/node';
+// api/x-daily.ts  ←そのまま上書き
+export const config = { runtime: 'edge' };
 
-const BEARER = process.env.TWITTER_BEARER!;
-const DEFAULT_USERNAME = process.env.X_USERNAME || 'GGPL_shinjuku';
+const TZ = 'Asia/Tokyo';
+const BASE = 'https://api.twitter.com/2';
+const BEARER = process.env.TW_BEARER_TOKEN!;
+const USER_ID = process.env.TW_USER_ID!; // 例: 1755170447925749760 など。@GGPL_shinjuku を一度調べて入れる
 
-// X v2 recent search (過去7日程度) を日付で取る
-// ?date=YYYY-MM-DD&username=optional
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+function jstRange(dateStr?: string) {
+  const now = dateStr ? new Date(`${dateStr}T00:00:00+09:00`) : new Date();
+  const y = now.toLocaleString('sv-SE', { timeZone: TZ }).slice(0,10);
+  const start = new Date(`${y}T00:00:00+09:00`);
+  const end   = new Date(`${y}T23:59:59+09:00`);
+  return {
+    start: start.toISOString(), // → UTC
+    end: end.toISOString(),
+    label: y
+  };
+}
+
+async function tw(path: string, params: Record<string,string>) {
+  const url = new URL(BASE + path);
+  for (const [k,v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${BEARER}` },
+    // Edge のHTTPキャッシュを活用（同日内の再取得を爆速に）
+    cache: 'force-cache',
+    next: { revalidate: 60 }, // 60秒で再検証
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(()=> '');
+    return new Response(JSON.stringify({ error: true, status: res.status, body: t }), { status: res.status });
+  }
+  return res.json();
+}
+
+export default async function handler(req: Request): Promise<Response> {
   try {
-    const date = String(req.query.date || '').trim();
-    if (!date) return res.status(400).json({ error: 'Missing date (YYYY-MM-DD)' });
+    const { searchParams } = new URL(req.url);
+    const date = searchParams.get('date') ?? undefined;
+    const lite = searchParams.get('lite') === '1';
 
-    const username = String(req.query.username || DEFAULT_USERNAME).trim();
+    if (!BEARER) return new Response('Missing TW_BEARER_TOKEN', { status: 500 });
+    if (!USER_ID) return new Response('Missing TW_USER_ID', { status: 500 });
 
-    // ユーザーID取得
-    const user = await fetchJSON(
-      `https://api.twitter.com/2/users/by/username/${encodeURIComponent(username)}?user.fields=id,name,username`
-    );
-    if (!user?.data?.id) {
-      return res.status(404).json({ error: 'User not found', username });
-    }
-    const userId = user.data.id;
+    const r = jstRange(date);
 
-    // その日の0:00〜23:59:59(JST)の範囲で検索したいので、UTCに直してfrom/toを作る
-    const jstStart = new Date(`${date}T00:00:00+09:00`);
-    const jstEnd   = new Date(`${date}T23:59:59+09:00`);
-    const startTime = jstStart.toISOString();
-    const endTime   = jstEnd.toISOString();
+    // その日の投稿だけを最小フィールドで取得（速さ優先）
+    const params: Record<string,string> = {
+      'max_results': '100',
+      'start_time': r.start,
+      'end_time': r.end,
+      'exclude': 'retweets,replies',
+      'tweet.fields': 'created_at,text,lang',
+    };
 
-    // from:ユーザー かつ 時間範囲
-    // v2 searchでは from:username でOK（公式投稿とRT/返信も含む）。
-    const query = `from:${username}`;
+    const data = await tw(`/users/${USER_ID}/tweets`, params);
+    // tw() 失敗時は Response を返すのでそのまま返却
+    if (data instanceof Response) return data;
 
-    const searchUrl = new URL('https://api.twitter.com/2/tweets/search/recent');
-    searchUrl.searchParams.set('query', query);
-    searchUrl.searchParams.set('start_time', startTime);
-    searchUrl.searchParams.set('end_time', endTime);
-    searchUrl.searchParams.set('max_results', '100');
-    searchUrl.searchParams.set('tweet.fields', 'created_at,public_metrics,referenced_tweets,entities');
-    searchUrl.searchParams.set('expansions', 'referenced_tweets.id,attachments.media_keys,author_id');
-    searchUrl.searchParams.set('user.fields', 'username,name');
-    searchUrl.searchParams.set('media.fields', 'type,url,preview_image_url');
-
-    const tweets = await fetchJSON(searchUrl.toString());
-
-    // ざっくり集計（いいね・RT・リプの合計 等）
-    const list = (tweets?.data || []).map((t: any) => ({
+    const tweets = (data?.data ?? []).map((t: any) => ({
       id: t.id,
-      text: t.text,
       created_at: t.created_at,
-      metrics: t.public_metrics,
-      type: detectType(t) // tweet / retweet / reply / quote
+      text: t.text,
+      url: `https://x.com/i/web/status/${t.id}`,
     }));
 
-    const summary = list.reduce((acc: any, t: any) => {
-      acc.count++;
-      acc.likes += t.metrics?.like_count || 0;
-      acc.rts   += t.metrics?.retweet_count || 0;
-      acc.replies += t.metrics?.reply_count || 0;
-      acc.quotes  += t.metrics?.quote_count || 0;
-      acc.types[t.type] = (acc.types[t.type] || 0) + 1;
-      return acc;
-    }, { count: 0, likes: 0, rts: 0, replies: 0, quotes: 0, types: {} as Record<string, number> });
+    const payload = lite ? tweets : {
+      status: tweets.length ? 'ok' : 'empty',
+      range: { jst: r.label, start: r.start, end: r.end },
+      count: tweets.length,
+      tweets,
+    };
 
-    return res.status(200).json({
-      username,
-      date,
-      window: { startTime, endTime },
-      total: summary,
-      tweets: list
+    return new Response(JSON.stringify(payload, null, 2), {
+      status: 200,
+      headers: { 'content-type': 'application/json; charset=utf-8' }
     });
-
-  } catch (err: any) {
-    const code = Number(err?.status || err?.code || 500);
-    return res.status(code >= 400 && code < 600 ? code : 500).json({
-      error: 'fetch_failed',
-      detail: err?.message || String(err)
-    });
+  } catch (e:any) {
+    return new Response(JSON.stringify({ error: true, message: e?.message ?? String(e) }), { status: 500 });
   }
-}
-
-async function fetchJSON(url: string) {
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${BEARER}` }
-  });
-  if (r.status === 429) {
-    // シンプルなリトライ（wait 2s）
-    await new Promise((ok) => setTimeout(ok, 2000));
-    return fetchJSON(url);
-  }
-  if (!r.ok) {
-    const text = await r.text();
-    const err: any = new Error(text);
-    err.status = r.status;
-    throw err;
-  }
-  return r.json();
-}
-
-function detectType(t: any): 'tweet'|'retweet'|'reply'|'quote' {
-  const refs = t?.referenced_tweets || [];
-  if (refs.some((r: any) => r.type === 'retweeted')) return 'retweet';
-  if (refs.some((r: any) => r.type === 'replied_to')) return 'reply';
-  if (refs.some((r: any) => r.type === 'quoted')) return 'quote';
-  return 'tweet';
 }
